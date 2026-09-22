@@ -375,7 +375,7 @@ func prepareOpenclawConfig(envRoot, workDir string, opts OpenclawConfigPrep) (Op
 	}
 	timeout := resolveOpenclawCLITimeout(opts.Timeout, opts.Logger)
 
-	activePath, exists, resolvedList, agentsFromRegistry, cached, err := discoverOpenclawConfig(bin, timeout, opts)
+	activePath, exists, resolvedList, agentsSource, cached, err := discoverOpenclawConfig(bin, timeout, opts)
 	if err != nil {
 		return OpenclawConfigResult{}, err
 	}
@@ -452,7 +452,7 @@ func prepareOpenclawConfig(envRoot, workDir string, opts OpenclawConfigPrep) (Op
 		}
 	}
 
-	cfg := buildPerTaskOpenclawConfig(activePath, exists, resetPath, resolvedList, agentsFromRegistry, workDir, managedMcp, hasManagedMcp, opts.Gateway)
+	cfg := buildPerTaskOpenclawConfig(activePath, exists, resetPath, resolvedList, agentsSource, workDir, managedMcp, hasManagedMcp, opts.Gateway)
 
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
@@ -484,16 +484,17 @@ func prepareOpenclawConfig(envRoot, workDir string, opts OpenclawConfigPrep) (Op
 			"active_config_exists", exists,
 			"include_target", includeTarget,
 			"include_root", result.IncludeRoot,
-			"agents_from_registry", agentsFromRegistry,
+			"agents_source", string(agentsSource),
 			"discovery_cached", cached,
 			"managed_mcp", hasManagedMcp)
 	}
 	return result, nil
 }
 
-// discoverOpenclawConfig resolves the user's active config path and resolved
-// agents.list, serving both from the shared per-profile cache when the cached
-// evidence still matches the host (see openclaw_config_cache.go).
+// discoverOpenclawConfig resolves the user's active config path, the resolved
+// per-agent rows and the schema they came from, serving all three from the
+// shared per-profile cache when the cached evidence still matches the host (see
+// openclaw_config_cache.go).
 //
 // The two are cached as one unit because they are read as one unit: a hit that
 // covered only the path would still pay the second CLI call, which on the host
@@ -503,12 +504,12 @@ func prepareOpenclawConfig(envRoot, workDir string, opts OpenclawConfigPrep) (Op
 // only costs the CLI round-trips this call was going to make anyway, so
 // discovery keeps its existing fail-closed contract: only a real CLI failure
 // fails the task.
-func discoverOpenclawConfig(bin string, timeout time.Duration, opts OpenclawConfigPrep) (activePath string, exists bool, resolvedList []any, agentsFromRegistry bool, cached bool, err error) {
+func discoverOpenclawConfig(bin string, timeout time.Duration, opts OpenclawConfigPrep) (activePath string, exists bool, resolvedList []any, agentsSource openclawAgentsSource, cached bool, err error) {
 	cachePath := openclawDiscoveryCachePath(opts.CacheDir)
 	if entry, ok := loadOpenclawDiscoveryCache(cachePath, bin, time.Now()); ok {
 		list, decodeErr := decodeOpenclawCachedAgentsList(entry.AgentsList)
 		if decodeErr == nil {
-			return entry.ActiveConfigPath, true, list, entry.AgentsFromRegistry, true, nil
+			return entry.ActiveConfigPath, true, list, openclawAgentsSource(entry.AgentsSource), true, nil
 		}
 		if opts.Logger != nil {
 			opts.Logger.Warn("execenv: openclaw discovery cache entry unusable; rediscovering",
@@ -518,26 +519,44 @@ func discoverOpenclawConfig(bin string, timeout time.Duration, opts OpenclawConf
 
 	activePath, exists, err = openclawActiveConfigPath(bin, timeout)
 	if err != nil {
-		return "", false, nil, false, false, fmt.Errorf("locate openclaw active config: %w", err)
+		return "", false, nil, "", false, fmt.Errorf("locate openclaw active config: %w", err)
 	}
 	if !exists {
 		// Deliberately not cached: "no config on disk" is the one state that
 		// flips the moment the user runs OpenClaw's own setup, and caching it
 		// would keep a freshly configured host running without its models and
 		// auth profiles for the rest of the TTL.
-		return activePath, false, nil, false, false, nil
+		return activePath, false, nil, "", false, nil
 	}
 
-	resolvedList, agentsFromRegistry, err = openclawResolvedAgentsList(bin, timeout)
+	resolvedList, agentsSource, err = openclawResolvedAgentsList(bin, timeout)
 	if err != nil {
-		return "", false, nil, false, false, fmt.Errorf("read openclaw agents.list: %w", err)
+		return "", false, nil, "", false, fmt.Errorf("read openclaw agents.list: %w", err)
 	}
-	if storeErr := storeOpenclawDiscoveryCache(cachePath, bin, activePath, resolvedList, agentsFromRegistry, time.Now()); storeErr != nil && opts.Logger != nil {
+	if storeErr := storeOpenclawDiscoveryCache(cachePath, bin, activePath, resolvedList, agentsSource, time.Now()); storeErr != nil && opts.Logger != nil {
 		opts.Logger.Warn("execenv: could not cache openclaw discovery; next task will rerun the CLI",
 			"cache", cachePath, "error", storeErr)
 	}
-	return activePath, exists, resolvedList, agentsFromRegistry, false, nil
+	return activePath, exists, resolvedList, agentsSource, false, nil
 }
+
+// openclawAgentsSource names the OpenClaw surface the resolved per-agent rows
+// were read from. It is what decides how — and whether — they may be written
+// back into the per-task wrapper, so it is carried explicitly rather than
+// inferred from a boolean: `agents.list[]` and `agents.entries.<id>` are config
+// schemas this daemon can pin a per-agent `workspace` in, while registry rows
+// (`agents list --json`) are read-only and must never be emitted as config.
+type openclawAgentsSource string
+
+const (
+	// openclawAgentsSourceList — pre-2026.6 config: `agents.list[]`.
+	openclawAgentsSourceList openclawAgentsSource = "list"
+	// openclawAgentsSourceEntries — 2026.8+ config: `agents.entries.<id>`.
+	openclawAgentsSourceEntries openclawAgentsSource = "entries"
+	// openclawAgentsSourceRegistry — the sqlite-backed registry, via
+	// `openclaw agents list --json`. Read-only.
+	openclawAgentsSourceRegistry openclawAgentsSource = "registry"
+)
 
 // buildPerTaskOpenclawConfig assembles the wrapper map that goes on disk.
 //
@@ -548,9 +567,18 @@ func discoverOpenclawConfig(bin string, timeout time.Duration, opts OpenclawConf
 // field of every resolved entry (id, model, prompts, tools, …) verbatim
 // with only `workspace` rewritten — this is robust regardless of whether
 // the runtime merges the sibling array or replaces it, because either way
-// the resulting list is shape-equivalent to the user's minus workspace.
-// The same treatment applies to the 2026.8+ `agents.entries.<id>` map, which
-// carries the id in the map key rather than in the entry object.
+// the resulting list is shape-equivalent to the user's minus workspace. That
+// list is a lossless round-trip of the user's own file, so copying it changes
+// nothing but the one field we mean to change.
+//
+// The 2026.8+ `agents.entries.<id>` map is *not* a lossless round-trip and must
+// not be treated as one: `config get` redacts the config on its way out (a
+// sensitive value comes back as the literal `__OPENCLAW_REDACTED__`), and the
+// wrapper's sibling keys win the $include merge, so copying the resolved entry
+// would write that sentinel over the user's real secret for every task. The
+// write-back there is `workspace` alone — objects merge recursively under
+// $include, so one key per id is enough to pin the workspace and nothing else
+// is observed, copied, or dropped. See rewriteAgentsEntriesWorkspaces.
 //
 // Exists=false: a fresh install with no on-disk config. Emit a minimal
 // config containing only the workspace override. There is no user data to
@@ -572,32 +600,36 @@ func discoverOpenclawConfig(bin string, timeout time.Duration, opts OpenclawConf
 // stage has already nulled the user's server map, the resulting view of
 // `mcp.servers` is exactly the managed set — including `{}` for "admin saved
 // no servers" (mirrors `hasManagedCodexMcpConfig`).
-func buildPerTaskOpenclawConfig(activePath string, exists bool, resetPath string, resolvedList []any, agentsFromRegistry bool, workDir string, managedMcp map[string]any, hasManagedMcp bool, gateway OpenclawGatewayPin) map[string]any {
+func buildPerTaskOpenclawConfig(activePath string, exists bool, resetPath string, resolvedList []any, agentsSource openclawAgentsSource, workDir string, managedMcp map[string]any, hasManagedMcp bool, gateway OpenclawGatewayPin) map[string]any {
 	agents := map[string]any{
 		"defaults": map[string]any{"workspace": workDir},
 	}
-	// Per-agent overrides are written back only in the schema they were read
-	// from. A registry-sourced list (OpenClaw 2026.6.x/2026.7.x) is NOT valid
-	// `agents.list[]` config — the schema validator rejects it ("agents.list.0:
-	// Invalid input") and fails closed before the agent runs — so those hosts
-	// get `agents.defaults.workspace` (set above) as their only per-task knob,
-	// which is sufficient there: OpenClaw applies it to the agent it selects
-	// from the registry (see upstream #3028, write-side half).
+	// Per-agent overrides are written back only into the schema the rows were
+	// actually read from (see openclawAgentsSource). A registry-sourced list
+	// (OpenClaw 2026.6.x/2026.7.x, `agents list --json`) is *not* config — the
+	// schema validator rejects its CLI-only fields ("agents.list.0: Invalid
+	// input") and fails closed before the agent runs — so those hosts get
+	// `agents.defaults.workspace` (set above) as their only per-task knob, which
+	// is sufficient there: OpenClaw applies it to the agent it selects from the
+	// registry (see upstream #3028, write-side half).
 	//
 	// 2026.8+ moved the agents out of `agents.list` into `agents.entries.<id>`,
 	// and that schema *is* writable: a host that pins an absolute per-agent
 	// `workspace` there outranks `agents.defaults.workspace` verbatim, so
 	// without this write-back every task on such a host runs in the gateway's
 	// own workspace instead of its prepared workdir (skills/ never loads).
-	// openclawResolvedAgentsEntriesOrRegistry marks the entries it resolved so
-	// this branch can tell them apart from registry rows, which carry no such
-	// marker and are therefore still never written back.
-	if !agentsFromRegistry {
+	switch agentsSource {
+	case openclawAgentsSourceList:
 		if rewritten := rewriteAgentsListWorkspaces(resolvedList, workDir); rewritten != nil {
 			agents["list"] = rewritten
 		}
-	} else if rewritten := rewriteAgentsEntriesWorkspaces(resolvedList, workDir); rewritten != nil {
-		agents["entries"] = rewritten
+	case openclawAgentsSourceEntries:
+		if rewritten := rewriteAgentsEntriesWorkspaces(resolvedList, workDir); rewritten != nil {
+			agents["entries"] = rewritten
+		}
+	case openclawAgentsSourceRegistry, "":
+		// Read-only source (or nothing discovered): `agents.defaults.workspace`
+		// above is the whole per-task override.
 	}
 	cfg := map[string]any{
 		"agents": agents,
@@ -704,43 +736,49 @@ func rewriteAgentsListWorkspaces(list []any, workDir string) []any {
 // `[]any` because that is the shape the discovery cache stores and re-reads for
 // every schema (see openclaw_config_cache.go) and because a list is what the
 // rest of the resolver contract speaks. The map key — the agent id — has no
-// field of its own inside the entry object, so it rides along out of band and is
-// stripped again on the way into the wrapper: writing these two keys into the
-// user's config would be a schema change we have no business making.
-const (
-	openclawEntriesKeyField    = "__multica_entries_key"
-	openclawEntriesSourceField = "__multica_entries_source"
-)
+// field of its own inside the entry object, so it rides along out of band on
+// each row and is stripped again on the way into the wrapper: writing this key
+// into the user's config would be a schema change we have no business making.
+//
+// Nothing else about an entry is carried: `config get` hands back redacted
+// values (see rewriteAgentsEntriesWorkspaces), so keeping the payload around
+// would only create copies — in the row, in the cache file — of data that must
+// never be written back anyway.
+const openclawEntriesKeyField = "__multica_entries_key"
 
 // rewriteAgentsEntriesWorkspaces rebuilds the `agents.entries.<id>` map from a
 // resolved entries list, pinning every entry's `workspace` to workDir.
 //
-// Returns nil unless *every* element came from the entries probe (see
-// openclawResolvedAgentsEntriesOrRegistry), which is also what keeps a
-// registry-sourced list from being written back: registry rows carry the
-// CLI-only fields OpenClaw's validator rejects ("agents.entries.main: Invalid
-// input"). An empty map is nil too, so the caller omits the key entirely rather
-// than replacing whatever the $include carries with `entries: {}`.
+// **Each entry carries `workspace` and nothing else.** The resolved entries
+// cannot be copied through: `config get` redacts the config before extracting
+// the path it was asked for, so any sensitive per-agent field (memory search
+// API key, web fetch headers, sandbox SSH credentials, …) comes back as the
+// literal `__OPENCLAW_REDACTED__` sentinel. `$include` resolves as
+// deepMerge(included, siblings) with the wrapper's siblings winning, so copying
+// the entry would write that sentinel over the user's real secret for every
+// task, and nothing on OpenClaw's load path restores it. Emitting one key per id
+// is both sufficient — objects merge recursively, so every other field still
+// arrives from the user's own config verbatim — and safe.
+//
+// Returns nil unless *every* element carries the entries-probe key, so a list
+// from any other source never reaches the wrapper as `agents.entries`: rows
+// from the registry carry CLI-only fields OpenClaw's validator rejects
+// ("agents.entries.main: Invalid input"), and on the generations that have a
+// registry fallback the `agents.entries` path does not exist at all. An empty
+// map is nil too, so the caller omits the key entirely rather than replacing
+// whatever the $include carries with `entries: {}`.
 func rewriteAgentsEntriesWorkspaces(list []any, workDir string) map[string]any {
 	entries := make(map[string]any, len(list))
 	for _, item := range list {
 		entry, ok := item.(map[string]any)
-		if !ok || entry[openclawEntriesSourceField] != true {
+		if !ok {
 			return nil
 		}
 		id, ok := entry[openclawEntriesKeyField].(string)
 		if !ok || id == "" {
 			return nil
 		}
-		copyEntry := make(map[string]any, len(entry)-1)
-		for k, v := range entry {
-			if k == openclawEntriesKeyField || k == openclawEntriesSourceField {
-				continue
-			}
-			copyEntry[k] = v
-		}
-		copyEntry["workspace"] = workDir
-		entries[id] = copyEntry
+		entries[id] = map[string]any{"workspace": workDir}
 	}
 	if len(entries) == 0 {
 		return nil
@@ -1174,30 +1212,32 @@ func isOpenclawConfigFileUnsupported(err error) bool {
 		(strings.Contains(msg, "unknown") && strings.Contains(msg, "config") && strings.Contains(msg, "file"))
 }
 
-// openclawResolvedAgentsList fetches the user's resolved per-agent list and
-// reports which schema produced it. The schema matters downstream: a config-
-// sourced list is itself valid `agents.list[]` config and may be written back
-// into the wrapper to pin per-agent workspaces, whereas a registry-sourced
-// list MUST NOT be written back — see openclawRegistryAgentsList.
+// openclawResolvedAgentsList fetches the user's resolved per-agent rows and
+// reports which surface produced them (see openclawAgentsSource). The source
+// matters downstream: rows that came from a config schema may be written back
+// into the wrapper to pin per-agent workspaces, whereas registry rows MUST NOT
+// be written back at all — see openclawRegistryAgentsList.
 //
 // Three schemas are supported:
 //
 //   - Pre-2026.6: agents live in the config under `agents.list`. We read them
 //     via `openclaw config get agents.list --json`, which returns the post-
-//     include, post-env-substitution array. fromRegistry=false.
+//     include, post-env-substitution array. openclawAgentsSourceList.
 //   - 2026.8+: the same CLI reports `Unknown config path: agents.list` and
 //     carries the agents under `agents.entries.<id>` instead. That path *is*
 //     writable, so it is read through the same deadline as the attempt above
-//     and returned with a marker this package strips again on write-back; see
-//     openclawResolvedAgentsEntriesOrRegistry. fromRegistry=true, because a
-//     keyed entries payload is not `agents.list[]` config.
+//     and returned with only the id carried out of band; see
+//     openclawResolvedAgentsEntriesOrRegistry. openclawAgentsSourceEntries —
+//     a keyed entries payload is not `agents.list[]` config.
 //   - 2026.6.x/2026.7.x: neither config path exists — agents live in a sqlite
 //     registry. `config get agents.list` exits non-zero with "Config path not
 //     found: agents.list". We fall back to the `openclaw agents list --json`
-//     *subcommand*, whose rows must never be written back. fromRegistry=true.
+//     *subcommand*, whose rows must never be written back.
+//     openclawAgentsSourceRegistry.
 //
-// Returns (nil, false, nil) when neither source yields any agents.
-func openclawResolvedAgentsList(bin string, timeout time.Duration) ([]any, bool, error) {
+// Returns a nil list when a source answered with no agents; the source still
+// names what answered.
+func openclawResolvedAgentsList(bin string, timeout time.Duration) ([]any, openclawAgentsSource, error) {
 	// One deadline for both config-schema probes. They ask the same question —
 	// what does the config schema carry per agent? — and the second is only
 	// reached when the first answers "no such path", exactly like
@@ -1214,7 +1254,7 @@ func openclawResolvedAgentsList(bin string, timeout time.Duration) ([]any, bool,
 // openclawResolvedAgentsListWithinDeadline is the shared-deadline half of
 // openclawResolvedAgentsList: every config-schema probe it makes runs under the
 // ctx it is handed, and only the registry fallback starts a budget of its own.
-func openclawResolvedAgentsListWithinDeadline(ctx context.Context, bin string, timeout time.Duration) ([]any, bool, error) {
+func openclawResolvedAgentsListWithinDeadline(ctx context.Context, bin string, timeout time.Duration) ([]any, openclawAgentsSource, error) {
 	out, err := openclawExec(ctx, bin, "config", "get", "agents.list", "--json")
 	if err != nil {
 		if isOpenclawKeyMissingResult(out, err, "agents.list") {
@@ -1224,13 +1264,13 @@ func openclawResolvedAgentsListWithinDeadline(ctx context.Context, bin string, t
 				return openclawResolvedAgentsEntriesOrRegistry(ctx, bin, timeout)
 			}
 			list, rerr := openclawRegistryAgentsList(bin, timeout)
-			return list, true, rerr
+			return list, openclawAgentsSourceRegistry, rerr
 		}
-		return nil, false, annotateOpenclawJSONError(err, out)
+		return nil, "", annotateOpenclawJSONError(err, out)
 	}
 	trimmed := strings.TrimSpace(out)
 	if trimmed == "" || trimmed == "null" {
-		return nil, false, nil
+		return nil, openclawAgentsSourceList, nil
 	}
 	// An envelope that arrived without a non-zero exit must reach the same
 	// verdict as one that did; see openclawStdoutEnvelopeError. Missing the
@@ -1248,15 +1288,15 @@ func openclawResolvedAgentsListWithinDeadline(ctx context.Context, bin string, t
 				return openclawResolvedAgentsEntriesOrRegistry(ctx, bin, timeout)
 			}
 			list, rerr := openclawRegistryAgentsList(bin, timeout)
-			return list, true, rerr
+			return list, openclawAgentsSourceRegistry, rerr
 		}
-		return nil, false, openclawStdoutEnvelopeError("config get agents.list --json", message)
+		return nil, "", openclawStdoutEnvelopeError("config get agents.list --json", message)
 	}
 	var list []any
 	if err := json.Unmarshal([]byte(trimmed), &list); err != nil {
-		return nil, false, fmt.Errorf("parse `openclaw config get agents.list --json` output: %w", err)
+		return nil, "", fmt.Errorf("parse `openclaw config get agents.list --json` output: %w", err)
 	}
-	return list, false, nil
+	return list, openclawAgentsSourceList, nil
 }
 
 // openclawResolvedAgentsEntriesOrRegistry runs the config-schema read that
@@ -1265,25 +1305,29 @@ func openclawResolvedAgentsListWithinDeadline(ctx context.Context, bin string, t
 //
 // `agents.entries` is a map keyed by agent id, and that key is the only place
 // the id exists — the entry object itself may carry no `id` field at all (a
-// minimal `{"workspace": "..."}` is a valid entry). The resolved list
-// therefore carries the key out of band on each entry, which is also how the
-// write-back in buildPerTaskOpenclawConfig tells these rows apart from registry
-// rows that must never reach the wrapper.
+// minimal `{"workspace": "..."}` is a valid entry). Each resolved row therefore
+// carries the key out of band, and nothing else: the payload is redacted and is
+// never written back (see rewriteAgentsEntriesWorkspaces). That marker is also
+// how the write-back tells these rows apart from registry rows, which must
+// never reach the wrapper.
 //
-// fromRegistry=true on the way out: this payload is keyed entries, not
-// `agents.list[]`, so the caller must not write it back as `agents.list`.
-func openclawResolvedAgentsEntriesOrRegistry(ctx context.Context, bin string, timeout time.Duration) ([]any, bool, error) {
+// Reports openclawAgentsSourceEntries when this path answered, and
+// openclawAgentsSourceRegistry when it fell back to the sqlite registry — the
+// generations where that fallback fires are exactly the ones where
+// `agents.entries` is not a valid config path, so the caller must not write the
+// rows back under that key.
+func openclawResolvedAgentsEntriesOrRegistry(ctx context.Context, bin string, timeout time.Duration) ([]any, openclawAgentsSource, error) {
 	out, err := openclawExec(ctx, bin, "config", "get", "agents.entries", "--json")
 	if err != nil {
 		if isOpenclawKeyMissingResult(out, err, "agents.entries") {
 			list, rerr := openclawRegistryAgentsList(bin, timeout)
-			return list, true, rerr
+			return list, openclawAgentsSourceRegistry, rerr
 		}
-		return nil, false, annotateOpenclawJSONError(err, out)
+		return nil, "", annotateOpenclawJSONError(err, out)
 	}
 	trimmed := strings.TrimSpace(out)
 	if trimmed == "" || trimmed == "null" {
-		return nil, false, nil
+		return nil, openclawAgentsSourceEntries, nil
 	}
 	// Same envelope rule as the `agents.list` probe above: on the generations
 	// where this path is valid but the user has not written it, the CLI reports
@@ -1292,29 +1336,22 @@ func openclawResolvedAgentsEntriesOrRegistry(ctx context.Context, bin string, ti
 	if message, isEnvelope := openclawJSONErrorMessage(trimmed); isEnvelope {
 		if openclawKeyMissingMessageForPath(message, "agents.entries") {
 			list, rerr := openclawRegistryAgentsList(bin, timeout)
-			return list, true, rerr
+			return list, openclawAgentsSourceRegistry, rerr
 		}
-		return nil, false, openclawStdoutEnvelopeError("config get agents.entries --json", message)
+		return nil, "", openclawStdoutEnvelopeError("config get agents.entries --json", message)
 	}
 	var entries map[string]any
 	if err := json.Unmarshal([]byte(trimmed), &entries); err != nil {
-		return nil, false, fmt.Errorf("parse `openclaw config get agents.entries --json` output: %w", err)
+		return nil, "", fmt.Errorf("parse `openclaw config get agents.entries --json` output: %w", err)
 	}
 	list := make([]any, 0, len(entries))
 	for id, raw := range entries {
-		entry, ok := raw.(map[string]any)
-		if !ok {
-			return nil, false, fmt.Errorf("parse `openclaw config get agents.entries --json` output: entry %q is not an object", id)
+		if _, ok := raw.(map[string]any); !ok {
+			return nil, "", fmt.Errorf("parse `openclaw config get agents.entries --json` output: entry %q is not an object", id)
 		}
-		copyEntry := make(map[string]any, len(entry)+2)
-		for k, v := range entry {
-			copyEntry[k] = v
-		}
-		copyEntry[openclawEntriesKeyField] = id
-		copyEntry[openclawEntriesSourceField] = true
-		list = append(list, copyEntry)
+		list = append(list, map[string]any{openclawEntriesKeyField: id})
 	}
-	return list, true, nil
+	return list, openclawAgentsSourceEntries, nil
 }
 
 // openclawRegistryAgentsList resolves agents from the sqlite-backed registry
@@ -1334,10 +1371,10 @@ func openclawResolvedAgentsEntriesOrRegistry(ctx context.Context, bin string, ti
 // `agents.entries.<id>` — and reach it through openclawResolvedAgentsEntriesOrRegistry
 // without ever consulting this function.
 //
-// Callers gate the write-back on the fromRegistry verdict from
-// openclawResolvedAgentsList (true here) and, within that branch, on the
-// entries marker those resolved rows carry; rows from this subcommand carry
-// neither and are therefore never written to the wrapper by any route.
+// Callers gate the write-back on the source
+// openclawResolvedAgentsList reports (openclawAgentsSourceRegistry here, which
+// no write-back branch accepts); rows from this subcommand are therefore never
+// written to the wrapper by any route.
 //
 // Returns nil (not an error) when the registry is empty or the subcommand
 // reports no agents.
