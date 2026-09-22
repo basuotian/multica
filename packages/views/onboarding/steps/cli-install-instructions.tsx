@@ -3,13 +3,12 @@
 import { useState } from "react";
 import { Check, Copy, Terminal } from "lucide-react";
 import { Card, CardContent } from "@multica/ui/components/ui/card";
+import { CliInstallCommand } from "@multica/ui/components/common/cli-install-command";
 import { CODE_LIGATURE_CLASS } from "@multica/ui/lib/code-style";
 import { cn } from "@multica/ui/lib/utils";
 import { copyText } from "@multica/ui/lib/clipboard";
 import { useT } from "../../i18n";
 
-const INSTALL_CMD =
-  "curl -fsSL https://raw.githubusercontent.com/multica-ai/multica/main/scripts/install.sh | bash";
 const SETUP_CMD = "multica setup";
 
 function CopyButton({ text }: { text: string }) {
@@ -63,12 +62,12 @@ function Step({ n, label, cmd }: { n: number; label: string; cmd: string }) {
 }
 
 /**
- * CLI install instructions — two copy-and-run commands. Hardcoded because
- * there's nothing environmental to infer: step 1 is the public install
- * script, step 2 is the cloud `multica setup` which the CLI itself knows
- * the endpoints for. Local development tests a self-host variant by
- * typing the extended command directly in the terminal; no need to
- * thread env vars through React.
+ * CLI install instructions — two copy-and-run commands. Step 1 is the public
+ * install script, which differs per OS and so renders through
+ * `CliInstallCommand`'s platform switch; step 2 is the cloud
+ * `multica setup`, hardcoded because the CLI itself knows the endpoints for
+ * it. Local development tests a self-host variant by typing the extended
+ * command directly in the terminal; no need to thread env vars through React.
  */
 export function CliInstallInstructions() {
   const { t } = useT("onboarding");
@@ -78,7 +77,19 @@ export function CliInstallInstructions() {
         <p className="text-caption leading-[1.55] text-muted-foreground">
           {t(($) => $.cli_install.intro)}
         </p>
-        <Step n={1} label={t(($) => $.cli_install.step1_label)} cmd={INSTALL_CMD} />
+        <div>
+          <p className="mb-1.5 text-caption font-medium text-foreground">
+            {`1. ${t(($) => $.cli_install.step1_label)}`}
+          </p>
+          <CliInstallCommand
+            labels={{
+              group: t(($) => $.cli_install.platform_group),
+              macosLinux: t(($) => $.cli_install.platform_macos_linux),
+              windows: t(($) => $.cli_install.platform_windows),
+              copy: t(($) => $.cli_install.copy_aria),
+            }}
+          />
+        </div>
         <Step n={2} label={t(($) => $.cli_install.step2_label)} cmd={SETUP_CMD} />
       </CardContent>
     </Card>

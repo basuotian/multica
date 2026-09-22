@@ -18,6 +18,7 @@ import {
   DialogTitle,
 } from "@multica/ui/components/ui/dialog";
 import { Button } from "@multica/ui/components/ui/button";
+import { CliInstallCommand } from "@multica/ui/components/common/cli-install-command";
 import { CODE_LIGATURE_CLASS } from "@multica/ui/lib/code-style";
 import { copyText } from "@multica/ui/lib/clipboard";
 import {
@@ -30,8 +31,6 @@ import { useT } from "../../i18n";
 
 type Step = "instructions" | "success";
 
-const INSTALL_CMD =
-  "curl -fsSL https://raw.githubusercontent.com/multica-ai/multica/main/scripts/install.sh | bash";
 const CLOUD_SERVER_URL = "https://api.multica.ai";
 const CLOUD_APP_URL = "https://multica.ai";
 
@@ -157,7 +156,9 @@ export function ConnectRemoteDialog({ onClose }: { onClose: () => void }) {
 }
 
 // ---------------------------------------------------------------------------
-// Copy button + code row — mirrors onboarding/CliInstallInstructions
+// Copy button + code row for the platform-independent commands (step 2 and
+// the troubleshooting token variant). Step 1's install command moves between
+// platforms, so it renders through CliInstallCommand instead.
 // ---------------------------------------------------------------------------
 
 function CopyButton({ text, ariaLabel }: { text: string; ariaLabel: string }) {
@@ -248,12 +249,23 @@ function InstructionsStep({ onClose }: { onClose: () => void }) {
 
       <div className="min-h-0 flex-1 overflow-y-auto px-6 py-4">
         <div className="space-y-4">
-          <CommandStep
-            n={1}
-            label={t(($) => $.connect.step1_label)}
-            cmd={INSTALL_CMD}
-            copyAria={t(($) => $.connect.copy_aria)}
-          />
+          {/* Step 1 owns the platform switch: the install command differs by
+              OS, so the user picks instead of us guessing (see
+              CLI_INSTALL_COMMANDS). Step 2's `multica setup` is
+              platform-independent and stays a plain command row. */}
+          <div>
+            <p className="mb-1.5 text-caption font-medium text-foreground">
+              {`1. ${t(($) => $.connect.step1_label)}`}
+            </p>
+            <CliInstallCommand
+              labels={{
+                group: t(($) => $.connect.platform_group),
+                macosLinux: t(($) => $.connect.platform_macos_linux),
+                windows: t(($) => $.connect.platform_windows),
+                copy: t(($) => $.connect.copy_aria),
+              }}
+            />
+          </div>
 
           <div>
             <CommandStep

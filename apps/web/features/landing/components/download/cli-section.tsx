@@ -1,18 +1,18 @@
 "use client";
 
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 import { Check, Copy, Terminal } from "lucide-react";
+import { CliInstallCommand } from "@multica/ui/components/common/cli-install-command";
 import { copyText } from "@multica/ui/lib/clipboard";
 import { useLocale } from "../../i18n";
 
-const INSTALL_CMD =
-  "curl -fsSL https://raw.githubusercontent.com/multica-ai/multica/main/scripts/install.sh | bash";
 const SETUP_CMD = "multica setup";
 
 /**
  * Scenario-first CLI section. Copy leans into servers / remote dev
  * boxes / headless setups rather than positioning CLI as a
- * lightweight Desktop. Two copy-and-paste command blocks.
+ * lightweight Desktop. Two copy-and-paste command blocks; the install one
+ * carries the platform switch, since install.sh and install.ps1 differ.
  */
 export function CliSection() {
   const { t } = useLocale();
@@ -29,12 +29,19 @@ export function CliSection() {
         </p>
 
         <div className="mt-10 flex flex-col gap-5">
-          <CommandBlock
-            label={d.installLabel}
-            cmd={INSTALL_CMD}
-            copyLabel={d.copyLabel}
-            copiedLabel={d.copiedLabel}
-          />
+          <div>
+            <CommandLabel>{d.installLabel}</CommandLabel>
+            <CliInstallCommand
+              variant="landing"
+              labels={{
+                group: d.platformGroup,
+                macosLinux: d.platformMacosLinux,
+                windows: d.platformWindows,
+                copy: d.copyLabel,
+                copied: d.copiedLabel,
+              }}
+            />
+          </div>
           <CommandBlock
             label={d.startLabel}
             cmd={SETUP_CMD}
@@ -46,6 +53,14 @@ export function CliSection() {
         <p className="mt-6 text-label text-[#0a0d12]/60">{d.sshNote}</p>
       </div>
     </section>
+  );
+}
+
+function CommandLabel({ children }: { children: ReactNode }) {
+  return (
+    <p className="mb-2 text-caption font-medium uppercase tracking-[0.08em] text-[#0a0d12]/55">
+      {children}
+    </p>
   );
 }
 
@@ -71,9 +86,7 @@ function CommandBlock({
 
   return (
     <div>
-      <p className="mb-2 text-caption font-medium uppercase tracking-[0.08em] text-[#0a0d12]/55">
-        {label}
-      </p>
+      <CommandLabel>{label}</CommandLabel>
       <div className="flex items-start gap-3 rounded-xl border border-[#0a0d12]/10 bg-white px-4 py-3 font-mono text-label">
         <Terminal
           className="mt-0.5 size-4 shrink-0 text-[#0a0d12]/55"
