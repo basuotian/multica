@@ -8,44 +8,23 @@ import { CliInstallInstructions } from "./cli-install-instructions";
 
 const TEST_RESOURCES = { en: { common: enCommon, onboarding: enOnboarding } };
 
-const UNIX_CMD =
-  "curl -fsSL https://raw.githubusercontent.com/multica-ai/multica/main/scripts/install.sh | bash";
 const WINDOWS_CMD =
   "irm https://raw.githubusercontent.com/multica-ai/multica/main/scripts/install.ps1 | iex";
 
-function renderCard() {
-  return render(
-    <I18nProvider locale="en" resources={TEST_RESOURCES}>
-      <CliInstallInstructions />
-    </I18nProvider>,
-  );
-}
-
 describe("CliInstallInstructions", () => {
-  it("defaults to the macOS / Linux installer", () => {
-    renderCard();
-
-    expect(screen.getByRole("tab", { name: "macOS / Linux" })).toHaveAttribute(
-      "aria-selected",
-      "true",
-    );
-    expect(screen.getByText(UNIX_CMD)).toBeInTheDocument();
-    expect(screen.queryByText(WINDOWS_CMD)).toBeNull();
-  });
-
-  it("switches the first step to the PowerShell installer", async () => {
+  // The switch itself is covered in common/cli-install-command.test.tsx; this
+  // checks the card wires it into step 1 and leaves step 2 shared.
+  it("offers the Windows installer in step 1 and keeps setup shared", async () => {
     const user = userEvent.setup();
-    renderCard();
+    render(
+      <I18nProvider locale="en" resources={TEST_RESOURCES}>
+        <CliInstallInstructions />
+      </I18nProvider>,
+    );
 
     await user.click(screen.getByRole("tab", { name: "Windows" }));
 
     expect(screen.getByText(WINDOWS_CMD)).toBeInTheDocument();
-    expect(screen.queryByText(UNIX_CMD)).toBeNull();
-  });
-
-  // Step 2 is platform-independent, so it must survive the switch untouched.
-  it("keeps the setup step shared across platforms", () => {
-    renderCard();
     expect(screen.getByText("multica setup")).toBeInTheDocument();
   });
 });

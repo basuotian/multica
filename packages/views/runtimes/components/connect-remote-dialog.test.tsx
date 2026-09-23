@@ -12,8 +12,8 @@ const TEST_RESOURCES = { en: { common: enCommon, runtimes: enRuntimes } };
 
 // Mocked at the module boundary rather than through navigator.clipboard: jsdom
 // exposes no clipboard, and user-event installs a getter-only stub of its own
-// that would swallow the assertion (MUL-style guard: assert what the button
-// hands to copyText, not what the browser then does with it).
+// that would swallow the assertion. Assert what the button hands to copyText,
+// not what the browser then does with it.
 const clipboard = vi.hoisted(() => ({
   copyText: vi.fn<(text: string) => Promise<boolean>>(),
 }));
@@ -118,28 +118,10 @@ describe("ConnectRemoteDialog", () => {
 
   // The install command is OS-specific, so the dialog can't hardcode one.
   // Before this switch existed the dialog shipped only the curl command and
-  // Windows users had no path at all, despite scripts/install.ps1.
-  it("swaps the install command when the platform tab changes", async () => {
-    const user = userEvent.setup();
-    const { baseElement } = renderDialog();
-
-    expect(
-      screen.getByRole("tab", { name: "macOS / Linux" }),
-    ).toHaveAttribute("aria-selected", "true");
-    expect(baseElement).toHaveTextContent("scripts/install.sh | bash");
-    expect(baseElement).not.toHaveTextContent("install.ps1");
-
-    await user.click(screen.getByRole("tab", { name: "Windows" }));
-
-    expect(screen.getByRole("tab", { name: "Windows" })).toHaveAttribute(
-      "aria-selected",
-      "true",
-    );
-    expect(baseElement).toHaveTextContent(WINDOWS_CMD);
-    expect(baseElement).not.toHaveTextContent("scripts/install.sh");
-  });
-
-  it("copies the command for the selected platform", async () => {
+  // Windows users had no path at all, despite scripts/install.ps1. The switch
+  // itself is covered in common/cli-install-command.test.tsx; this checks it
+  // is wired through to step 1's copy button.
+  it("copies the installer for the platform picked in step 1", async () => {
     const user = userEvent.setup();
     renderDialog();
 
