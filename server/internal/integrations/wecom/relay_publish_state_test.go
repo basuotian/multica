@@ -9,6 +9,7 @@ package wecom
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
 	"testing"
 	"time"
@@ -130,5 +131,68 @@ func TestRelayPublish_ReplyKeepsTheBoolSemantics(t *testing.T) {
 		if p.routed() {
 			t.Errorf("relayPublish(%d).routed() = true, want false", p)
 		}
+	}
+}
+
+// TestRelayPublish_FenceHoldsAgainstThePublishingReplica is the review's
+// remaining blocker: the fence must be unclaimable by EVERY delivery worker,
+// the one on the publishing replica included. That replica is the ordinary
+// reconnect case -- the acting agent's bot is down, the push falls back to the
+// recipient-wide bot, the socket then comes back here, and the frame the
+// fallback replaced is offered again. A fence planted under tokenFor would be
+// reclaimable by that very dispatcher (Claim answers "won" on a token match)
+// and the member would get a second card.
+func TestRelayPublish_FenceHoldsAgainstThePublishingReplica(t *testing.T) {
+	t.Parallel()
+	relay, dedupe := &fanoutRelay{}, newSharedDedupe()
+	reg := newSendersRegistry()
+	router := inboxPublishRouter(t, relay, dedupe,
+		RelayConfig{AcceptanceWindow: 40 * time.Millisecond},
+		NewOutbound(nil, reg, nil, slog.Default()))
+
+	instID := mustTestUUID(t)
+	inst := util.UUIDToString(instID)
+	frame := relayFrame{
+		Kind: relayKindInbox, InstallationID: inst,
+		ChatID: "T_USER", ChatType: chatTypeSingleInt, Content: "card",
+	}
+	eventID := relayInboxEventID("item-6", "recipient-1", inst)
+
+	// The bot is offline here, so nobody claims and the publisher fences the
+	// key -- the miss the fallback is owed for.
+	if got := router.publish(frame, eventID); got != relayNoHolder {
+		t.Fatalf("publish = %v, want relayNoHolder", got)
+	}
+	body, err := json.Marshal(frame)
+	if err != nil {
+		t.Fatalf("marshal frame: %v", err)
+	}
+
+	// The socket comes back ON THE PUBLISHING REPLICA and the same frame is
+	// offered again. The dispatcher retries it while it cannot take the claim,
+	// so give it room to try before asserting it delivered nothing.
+	conn := &recordingConn{}
+	reg.set(instID, conn.autoAck(newWSSender(conn, nil)))
+	router.DeliverWecomOutbound(inst, body, eventID)
+	time.Sleep(120 * time.Millisecond)
+	if n := conn.frameCount(); n != 0 {
+		t.Fatalf("the publishing replica delivered %d cards through the fence it planted", n)
+	}
+
+	// A DIFFERENT replica is blocked too, which it always was: the fenced value
+	// is not that replica's token either. Kept so the property is asserted as
+	// "every worker", not only the ones this change moved.
+	otherReg := newSendersRegistry()
+	otherConn := &recordingConn{}
+	otherReg.set(instID, otherConn.autoAck(newWSSender(otherConn, nil)))
+	other := NewRelayOutbound(relay, dedupe, RelayConfig{AcceptanceWindow: 40 * time.Millisecond}, slog.Default())
+	octx, ocancel := context.WithCancel(context.Background())
+	t.Cleanup(func() { ocancel(); other.Wait() })
+	other.Start(octx)
+	other.Attach(NewOutbound(nil, otherReg, nil, slog.Default()))
+	other.DeliverWecomOutbound(inst, body, eventID)
+	time.Sleep(60 * time.Millisecond)
+	if n := otherConn.frameCount(); n != 0 {
+		t.Fatalf("another replica delivered %d cards through the fence", n)
 	}
 }

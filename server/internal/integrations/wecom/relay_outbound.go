@@ -899,10 +899,13 @@ func (r *RelayOutbound) publish(f relayFrame, eventID string) relayPublish {
 // over from there. A key still absent at the end of the window means no replica
 // even took it — the frame is handed to each replica exactly once and only a
 // socket holder claims — so none ever will. The publisher then FENCES the key
-// under its own token and reports relayNoHolder, which is what lets the caller
+// under a token no delivery worker presents (fenceTokenFor) and reports
+// relayNoHolder, which is what lets the caller
 // route the notification somewhere else. The fence is what keeps that safe: a
 // dispatcher that is late, or a replica replaying the frame across a restart,
-// finds the claim taken and delivers nothing.
+// finds the claim taken and delivers nothing -- on the publishing replica too,
+// which is the one a fence under its own delivery token would NOT have stopped.
+// See fenceTokenFor.
 //
 // A claim store that cannot answer is relayUncertain: the delivery might be
 // happening, and the caller must not route a second copy on that.
@@ -943,7 +946,7 @@ func (r *RelayOutbound) confirmInbox(eventID string) relayPublish {
 			return relayUncertain
 		}
 	}
-	won, err := r.dedupe.Claim(ctx, key, r.tokenFor(eventID), r.dedupeTTL)
+	won, err := r.dedupe.Claim(ctx, key, r.fenceTokenFor(eventID), r.dedupeTTL)
 	if err != nil {
 		r.logger.WarnContext(ctx, "wecom relay: could not fence an unclaimed inbox delivery; the push is not re-routed",
 			"error", err, "event_id", eventID)
@@ -1204,6 +1207,19 @@ func settleBudgetSpent(ctx context.Context) bool {
 // tokenFor is the owner token one claim is held under: this process, and the
 // delivery. Stable across re-offers on this process, unique across replicas.
 func (r *RelayOutbound) tokenFor(eventID string) string { return r.owner + "/" + eventID }
+
+// fenceTokenFor is the token a no-holder fence is planted under, and it is
+// deliberately NOT tokenFor. Claim answers "won" when the stored value equals
+// the caller's token, so a fence planted under the publisher's own delivery
+// token would be reclaimable by that replica's dispatcher the moment its
+// socket came back -- the ordinary reconnect, not an exotic one -- and the
+// frame it then delivered would be the second card the fallback had already
+// replaced. The suffix makes the fenced value one no delivery worker ever
+// presents, so the fence holds against every worker on every replica, the
+// publishing one included. It is never released; the claim TTL retires it.
+func (r *RelayOutbound) fenceTokenFor(eventID string) string {
+	return r.tokenFor(eventID) + "/fence"
+}
 
 func dedupeKey(eventID string) string { return "wecom:outbound:claim:" + eventID }
 
