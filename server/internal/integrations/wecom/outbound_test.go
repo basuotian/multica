@@ -16,6 +16,7 @@ import (
 	"log/slog"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -649,6 +650,100 @@ func TestTryDeliverInbox_AgentBotLookupFailureFallsBack(t *testing.T) {
 	if body := conn.sendBody(t, 0); body["chatid"] != "T_USER_1" {
 		t.Errorf("inbox push chatid = %v, want the fallback bot", body["chatid"])
 	}
+}
+
+// The other half of the multi-bot rule. Preferring the acting agent's bot must
+// not make a notification LESS deliverable than the recipient-wide route was:
+// when agent A's bot has no live socket anywhere in the fleet, the push has to
+// fall back to the bot the recipient-wide lookup names — the same route that
+// carried this notification before the agent's bot was preferred.
+func TestTryDeliverInbox_FallsBackWhenTheActingAgentsBotHasNoLiveSender(t *testing.T) {
+	t.Parallel()
+	q := &fakeOutboundQueries{workspace: db.Workspace{Slug: "acme"}}
+	agentInstID := mustUUID("aaaaaaaa-1111-1111-1111-111111111111") // registered nowhere: no socket on any replica
+	fallbackInstID := mustUUID("bbbbbbbb-2222-2222-2222-222222222222")
+	reg := newSendersRegistry()
+	conn := &recordingConn{}
+	reg.set(fallbackInstID, conn.autoAck(newWSSender(conn, nil)))
+	o := NewOutbound(q, reg, nil, slog.Default())
+	q.agentMemberBinding = db.ChannelUserBinding{ChannelUserID: "T_AGENT_A_BOT", InstallationID: agentInstID}
+	q.memberBinding = db.ChannelUserBinding{ChannelUserID: "T_LATEST_BOT", InstallationID: fallbackInstID}
+
+	if !o.tryDeliverInbox(context.Background(), agentInboxItem("new_comment", "55555555-5555-5555-5555-555555555555"),
+		"33333333-3333-3333-3333-333333333333", "44444444-4444-4444-4444-444444444444") {
+		t.Fatal("tryDeliverInbox returned false; the recipient-wide binding still has a live socket")
+	}
+	if body := conn.sendBody(t, 0); body["chatid"] != "T_LATEST_BOT" {
+		t.Errorf("inbox push chatid = %v, want the recipient-wide bot", body["chatid"])
+	}
+}
+
+// A registered socket that refuses the write deadline is a second shape of the
+// same proof: SetWriteDeadline runs before WriteMessage, so nothing could have
+// reached the wire, and the recipient-wide bot is still owed the push.
+func TestTryDeliverInbox_FallsBackWhenTheActingAgentsBotWriteIsRefused(t *testing.T) {
+	t.Parallel()
+	q := &fakeOutboundQueries{workspace: db.Workspace{Slug: "acme"}}
+	agentInstID := mustUUID("aaaaaaaa-1111-1111-1111-111111111111")
+	fallbackInstID := mustUUID("bbbbbbbb-2222-2222-2222-222222222222")
+	reg := newSendersRegistry()
+	// Agent A's socket is up, but it will not accept a frame.
+	refusing := &deadlineRefusingConn{recordingConn: &recordingConn{}}
+	reg.set(agentInstID, refusing.recordingConn.autoAck(newWSSender(refusing, nil)))
+	conn := &recordingConn{}
+	reg.set(fallbackInstID, conn.autoAck(newWSSender(conn, nil)))
+	o := NewOutbound(q, reg, nil, slog.Default())
+	q.agentMemberBinding = db.ChannelUserBinding{ChannelUserID: "T_AGENT_A_BOT", InstallationID: agentInstID}
+	q.memberBinding = db.ChannelUserBinding{ChannelUserID: "T_LATEST_BOT", InstallationID: fallbackInstID}
+
+	if !o.tryDeliverInbox(context.Background(), agentInboxItem("new_comment", "55555555-5555-5555-5555-555555555555"),
+		"33333333-3333-3333-3333-333333333333", "44444444-4444-4444-4444-444444444444") {
+		t.Fatal("tryDeliverInbox returned false; a refused write is provably undelivered and must fall back")
+	}
+	if body := conn.sendBody(t, 0); body["chatid"] != "T_LATEST_BOT" {
+		t.Errorf("inbox push chatid = %v, want the recipient-wide bot", body["chatid"])
+	}
+}
+
+// The flip side of the fallback: a send whose fate is UNKNOWN — here, the
+// verdict never came back — may already be in the member's chat, so the
+// recipient-wide bot is deliberately NOT tried. Duplicating the card is worse
+// than a late one.
+func TestTryDeliverInbox_DoesNotFallBackOnAnUncertainSend(t *testing.T) {
+	t.Parallel()
+	q := &fakeOutboundQueries{workspace: db.Workspace{Slug: "acme"}}
+	agentInstID := mustUUID("aaaaaaaa-1111-1111-1111-111111111111")
+	fallbackInstID := mustUUID("bbbbbbbb-2222-2222-2222-222222222222")
+	reg := newSendersRegistry()
+	agentConn := &recordingConn{swallowAckFromSend: 1}
+	agentSender := newWSSender(agentConn, nil)
+	agentSender.ackTimeout = 50 * time.Millisecond
+	reg.set(agentInstID, agentConn.autoAck(agentSender))
+	fallbackConn := &recordingConn{}
+	reg.set(fallbackInstID, fallbackConn.autoAck(newWSSender(fallbackConn, nil)))
+	o := NewOutbound(q, reg, nil, slog.Default())
+	q.agentMemberBinding = db.ChannelUserBinding{ChannelUserID: "T_AGENT_A_BOT", InstallationID: agentInstID}
+	q.memberBinding = db.ChannelUserBinding{ChannelUserID: "T_LATEST_BOT", InstallationID: fallbackInstID}
+
+	if o.tryDeliverInbox(context.Background(), agentInboxItem("new_comment", "55555555-5555-5555-5555-555555555555"),
+		"33333333-3333-3333-3333-333333333333", "44444444-4444-4444-4444-444444444444") {
+		t.Error("tryDeliverInbox returned true for a send whose verdict never came back")
+	}
+	if frames := fallbackConn.sendFrames(); len(frames) != 0 {
+		t.Errorf("the recipient-wide bot was tried after an uncertain send: %d frames", len(frames))
+	}
+}
+
+// deadlineRefusingConn is a socket whose write deadline cannot be set, which is
+// the one write failure raised before WriteMessage is entered (ws_sender.go's
+// writeLocked). It is the "provably nothing left this process" case the
+// fallback is owed for.
+type deadlineRefusingConn struct {
+	*recordingConn
+}
+
+func (c *deadlineRefusingConn) SetWriteDeadline(time.Time) error {
+	return errors.New("write deadline refused")
 }
 
 // inboxActorAgent reads the payload the way both publishers spell it, and
