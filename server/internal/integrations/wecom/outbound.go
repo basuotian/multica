@@ -533,7 +533,9 @@ func taskAddress(ctx context.Context, q deliveryLookup, taskID pgtype.UUID) (rou
 	}, "", true, nil
 }
 
-// routeFrame hands a frame to the relay, and answers false when there is none.
+// routeFrame hands a frame to the relay and answers what that produced. A
+// caller with no second route reads it through relayPublish.routed; the inbox
+// push reads all four states, because only it can fall back to another bot.
 //
 // THE NIL CHECK IS HERE BECAUSE THE FIELD IS AN INTERFACE. It used to be a
 // *RelayOutbound, whose publish begins with `if r == nil`, so a call through a
@@ -541,9 +543,9 @@ func taskAddress(ctx context.Context, q deliveryLookup, taskID pgtype.UUID) (rou
 // A nil interface has no receiver to run that guard, so widening the field
 // silently removed the safety three call sites were standing on. One place to
 // check it, so the next call site cannot forget.
-func (o *Outbound) routeFrame(f relayFrame, eventID string) bool {
+func (o *Outbound) routeFrame(f relayFrame, eventID string) relayPublish {
 	if o.relay == nil {
-		return false
+		return relayNotWired
 	}
 	return o.relay.publish(f, eventID)
 }
@@ -630,7 +632,7 @@ func (o *Outbound) sendAsMessage(ctx context.Context, e events.Event, taskID pgt
 			WorkspaceID:    e.WorkspaceID,
 			SessionID:      e.ChatSessionID,
 			CarriesFiles:   carriesFiles,
-		}, relayEventID(e, taskID)) {
+		}, relayEventID(e, taskID)).routed() {
 			o.logger.DebugContext(ctx, "wecom outbound: routed to the replica holding the socket",
 				"installation_id", util.UUIDToString(addr.InstallationID), "chat_session_id", e.ChatSessionID)
 			return answerOutcome{addr: addr, routed: true}, nil
@@ -909,17 +911,35 @@ func (o *Outbound) pushInbox(ctx context.Context, item map[string]any, binding d
 		// that holds one. An inbox push is as user-visible as an answer, and
 		// leaving it local was the reason the single-replica constraint had to
 		// stay even with replies routed.
-		if o.routeFrame(relayFrame{
+		switch o.routeFrame(relayFrame{
 			Kind:           relayKindInbox,
 			InstallationID: util.UUIDToString(binding.InstallationID),
 			ChatID:         binding.ChannelUserID,
 			ChatType:       chatTypeSingleInt,
 			Content:        content,
-		}, relayInboxEventID(itemIDOf(item), recipientIDStr)) {
+		}, relayInboxEventID(itemIDOf(item), recipientIDStr, util.UUIDToString(binding.InstallationID))) {
+		case relayAccepted:
 			o.logger.DebugContext(ctx, "wecom outbound: routed an inbox push to the replica holding the socket",
 				"installation_id", uuidStringPub(binding.InstallationID))
 			return true, false
+		case relayUncertain:
+			// The bus call failed, or the claim store could not answer. A
+			// frame that may have been accepted and may already be on its way
+			// to the member's chat must NOT be re-routed: a duplicate card is
+			// worse than a late one.
+			o.logger.WarnContext(ctx, "wecom outbound: inbox push routed but its acceptance is unknown; not re-routing",
+				"installation_id", uuidStringPub(binding.InstallationID),
+				"recipient_id", recipientIDStr)
+			return false, false
+		case relayNotWired, relayNoHolder:
+			// Proven not delivered; the shared warn and the proven-miss
+			// return below carry it out.
 		}
+		// relayNotWired (no relay attached) and relayNoHolder (the frame was
+		// published, but across the acceptance window no replica took the
+		// delivery claim, so nobody holds this bot's socket) both prove the
+		// push did not reach WeCom; the caller may offer it to the
+		// recipient-wide binding.
 		// Logged, not counted on the reply counters. Their documented unit is
 		// AGENT REPLIES, and an inbox notification recorded there would show up
 		// as a reply this adapter owed somebody and failed to deliver — the

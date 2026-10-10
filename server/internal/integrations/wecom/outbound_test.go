@@ -734,6 +734,63 @@ func TestTryDeliverInbox_DoesNotFallBackOnAnUncertainSend(t *testing.T) {
 	}
 }
 
+// TestTryDeliverInbox_TriStateRelayMapping pins what each relay verdict means
+// to the fallback decision. Only a verdict that PROVES the card did not reach
+// WeCom may be re-routed: relayNotWired (no relay attached) and relayNoHolder
+// (published, but no replica ever took the delivery claim). relayAccepted is a
+// delivery; relayUncertain may already be one, so it must stay put.
+func TestTryDeliverInbox_TriStateRelayMapping(t *testing.T) {
+	t.Parallel()
+	const agentID = "55555555-5555-5555-5555-555555555555"
+	for _, tc := range []struct {
+		name          string
+		state         relayPublish
+		wantDelivered bool
+		wantFallback  int
+	}{
+		{"accepted is a delivery", relayAccepted, true, 0},
+		{"uncertain is not re-routed", relayUncertain, false, 0},
+		{"no holder falls back", relayNoHolder, true, 1},
+		{"no relay falls back", relayNotWired, true, 1},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			q := &fakeOutboundQueries{workspace: db.Workspace{Slug: "acme"}}
+			agentInstID := mustUUID("aaaaaaaa-1111-1111-1111-111111111111") // no socket here
+			fallbackInstID := mustUUID("bbbbbbbb-2222-2222-2222-222222222222")
+			reg := newSendersRegistry()
+			conn := &recordingConn{}
+			reg.set(fallbackInstID, conn.autoAck(newWSSender(conn, nil)))
+			relay := &scriptedRelay{state: tc.state}
+			o := NewOutbound(q, reg, nil, slog.Default(), WithRelay(relay))
+			q.agentMemberBinding = db.ChannelUserBinding{ChannelUserID: "T_AGENT_A_BOT", InstallationID: agentInstID}
+			q.memberBinding = db.ChannelUserBinding{ChannelUserID: "T_LATEST_BOT", InstallationID: fallbackInstID}
+
+			got := o.tryDeliverInbox(context.Background(), agentInboxItem("new_comment", agentID),
+				"33333333-3333-3333-3333-333333333333", "44444444-4444-4444-4444-444444444444")
+			if got != tc.wantDelivered {
+				t.Errorf("tryDeliverInbox = %v, want %v", got, tc.wantDelivered)
+			}
+			if n := len(conn.sendFrames()); n != tc.wantFallback {
+				t.Errorf("the recipient-wide bot was sent %d cards, want %d", n, tc.wantFallback)
+			}
+		})
+	}
+}
+
+// scriptedRelay is the router seam with a canned verdict, so the tri-state
+// mapping in pushInbox can be pinned without a bus or a claim store.
+type scriptedRelay struct {
+	state  relayPublish
+	frames []relayFrame
+}
+
+func (r *scriptedRelay) publish(f relayFrame, _ string) relayPublish {
+	r.frames = append(r.frames, f)
+	return r.state
+}
+
 // deadlineRefusingConn is a socket whose write deadline cannot be set, which is
 // the one write failure raised before WriteMessage is entered (ws_sender.go's
 // writeLocked). It is the "provably nothing left this process" case the
