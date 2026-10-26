@@ -3001,10 +3001,9 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 		RuntimeConfig:         runtimeConfig,
 		DisabledRuntimeSkills: disabledRuntimeSkillsFor(agent.DisabledRuntimeSkills, runtimeID, runtime.Provider),
 	}
-	// Resolve the OpenClaw per-run model pin once, here, and carry it on the
-	// run input. The daemon no longer decodes it from the agent's mutable
-	// runtime_config at dispatch, so a concurrent config edit can never change
-	// a value an in-flight run already resolved. Only openclaw consumes it.
+	// Snapshot the agent's persistent OpenClaw model override for this claim.
+	// It applies to every claim until changed or cleared; later edits do not
+	// affect payloads already delivered to the daemon.
 	if runtime.Provider == "openclaw" {
 		resp.ModelOverride = openclawModelOverride(agent.RuntimeConfig)
 	}

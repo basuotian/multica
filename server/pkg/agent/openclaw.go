@@ -193,7 +193,7 @@ func (b *openclawBackend) Execute(ctx context.Context, prompt string, opts ExecO
 
 		// Build usage map. Prefer the model openclaw reported in
 		// `meta.agentMeta.model` (the actual LLM, e.g. `deepseek-chat`), then the
-		// per-run model override the server pinned onto this task. Never fall
+		// agent model override snapshotted for this claim. Never fall
 		// back to opts.Model: for the openclaw backend that is the OpenClaw
 		// *agent* name passed via `--agent`, not a model identifier, and
 		// attributing usage to it would key the dashboard on the agent id. Last
@@ -223,10 +223,9 @@ func (b *openclawBackend) Execute(ctx context.Context, prompt string, opts ExecO
 // The CLI accepts separate --agent and --model flags. Multica intentionally
 // keeps those concerns separate: opts.Model selects the registered OpenClaw
 // agent (identity / workspace / session state), while opts.OpenclawModelOverride
-// — the per-run input the server resolved for this task — optionally selects
-// the underlying LLM for only this run. Instructions must still be injected
-// inline into --message because openclaw loads AGENTS.md from its own
-// workspace directory, not from cwd.
+// carries the agent's persistent underlying-model setting as of this claim.
+// Instructions must still be injected inline into --message because openclaw
+// loads AGENTS.md from its own workspace directory, not from cwd.
 //
 // Routing (issue #3260): `openclaw agent` defaults to Gateway routing; --local
 // is the embedded-mode opt-in. The daemon historically forced --local so every
@@ -257,10 +256,9 @@ func buildOpenclawArgs(prompt, sessionID string, opts ExecOptions, logger *slog.
 	if opts.Model != "" && !customArgsContains(customArgs, "--agent") {
 		args = append(args, "--agent", opts.Model)
 	}
-	// The per-run model pin comes from the task input (never from custom_args,
-	// which keeps --model in the blocked set). Emit it after --agent so the
-	// OpenClaw agent identity and the underlying model stay independently
-	// addressable.
+	// The saved agent model override arrives in the claim payload; --model
+	// stays blocked in custom_args. Emit it after --agent to keep the OpenClaw
+	// agent identity and the underlying model independently addressable.
 	if opts.OpenclawModelOverride != "" {
 		args = append(args, "--model", opts.OpenclawModelOverride)
 	}
@@ -286,8 +284,8 @@ func customArgsContains(args []string, flag string) bool {
 }
 
 // openclawUsageModel picks the model key for a run's usage record. It prefers
-// the model openclaw reported in the result, then the per-run model override
-// the server pinned onto this task, and finally the daemon's `unknown`
+// the model openclaw reported in the result, then the agent model override
+// snapshotted for this claim, and finally the daemon's `unknown`
 // placeholder. It deliberately never falls back to the OpenClaw agent identity
 // (ExecOptions.Model): that value is a registered OpenClaw agent id, not a
 // model, so keying usage on it would misattribute tokens on the dashboard.

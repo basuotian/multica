@@ -25,9 +25,8 @@ import { useT } from "../../../i18n";
 // fail-soft default — but the union accepts it as a defensive belt.
 interface FormState {
   mode: OpenclawRoutingMode;
-  // Optional underlying-model pin. Empty means "let OpenClaw use the model
-  // bound to the selected agent". Kept as a string so the input can be fully
-  // controlled while the user types.
+  // Persistent agent model override. Empty uses the model bound to the
+  // selected OpenClaw agent. A string keeps the input controlled while typing.
   modelOverride: string;
   host: string;
   port: string;

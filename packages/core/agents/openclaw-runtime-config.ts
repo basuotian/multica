@@ -17,10 +17,9 @@ export interface OpenclawGatewayPin {
 export interface OpenclawRuntimeConfig {
   mode?: OpenclawRoutingMode;
   gateway?: OpenclawGatewayPin;
-  // Optional per-run model pin. `agent.model` keeps selecting the OpenClaw
-  // agent identity (workspace/session/memory); this selects the underlying
-  // LLM for runs claimed while it is set. The server resolves it onto the run
-  // input at claim time; the daemon never re-reads it from live agent config.
+  // Persistent agent-level model override. `agent.model` selects the OpenClaw
+  // identity; this setting selects the underlying LLM for all runs claimed
+  // until it is changed or cleared. Each claim receives the current value.
   modelOverride?: string;
 }
 

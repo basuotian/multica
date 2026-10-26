@@ -300,11 +300,9 @@ func preserveMaskedGatewayToken(incoming any, persistedRuntimeConfig []byte) {
 	gw["token"] = prev.Gateway.Token
 }
 
-// openclawModelOverride extracts an OpenClaw per-run model pin from an agent's
-// runtime_config JSON. The server resolves it once, at claim time, and carries
-// it on the run input so the daemon never decodes the pin from mutable agent
-// configuration. Returns "" when the field is absent or the payload is
-// malformed; the value is trimmed so a whitespace-only pin reads as absent.
+// openclawModelOverride reads the agent's persistent underlying-model override
+// from runtime_config. Every claim snapshots the current setting until it is
+// changed or cleared. Absent, malformed, or whitespace-only values return "".
 func openclawModelOverride(raw []byte) string {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
@@ -454,11 +452,10 @@ type AgentTaskResponse struct {
 	CreatedAt          string                   `json:"created_at"`
 	PriorSessionID     string                   `json:"prior_session_id,omitempty"` // session ID from a previous task on same issue
 	PriorWorkDir       string                   `json:"prior_work_dir,omitempty"`   // work_dir from a previous task on same issue
-	// ModelOverride is the per-run OpenClaw model pin resolved by the server at
-	// claim time from the agent's runtime_config. It is carried as a run input
-	// (not re-read by the daemon from mutable agent configuration) so each
-	// claimed run gets a frozen value. Mirrors internal/daemon/types.go, same
-	// JSON name. Empty for every non-openclaw provider.
+	// ModelOverride snapshots the agent's persistent OpenClaw model override at
+	// claim time. Later config edits affect subsequent claims, not this payload.
+	// Mirrors internal/daemon/types.go with the same JSON name; empty for other
+	// providers.
 	ModelOverride string `json:"model_override,omitempty"`
 	// PriorSessionResumeUnavailable is set when a more recent Codex session was
 	// withheld because its rollout was missing (MUL-5305); PriorSessionID (if

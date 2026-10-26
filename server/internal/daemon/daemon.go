@@ -8011,10 +8011,8 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	var openclawModelOverride string
 	if task.Agent != nil && provider == "openclaw" {
 		openclawMode, openclawGateway = decodeOpenclawRuntimeConfig(task.Agent.RuntimeConfig, d.logger)
-		// The model override is a run input the server resolved at claim time,
-		// not a knob decoded from the agent's mutable runtime_config. Read it
-		// once here so every reuse/prepare/execute step for this task sees the
-		// same frozen value.
+		// Use the server's claim-time snapshot of the agent's persistent model
+		// override throughout preparation and execution.
 		openclawModelOverride = strings.TrimSpace(task.ModelOverride)
 	}
 	var agentEnvOverrides map[string]string

@@ -211,11 +211,14 @@ to clear. `agent copy` still carries the source value and has no override flag.
 `custom_args` are normally raw provider CLI args. The CLI help notes that some
 providers reject `--model` inside `custom_args`; provider backends filter flags
 they manage directly. For OpenClaw, `model` selects the registered OpenClaw
-agent ID (for example `main`). An optional `runtime_config.model_override`
-selects the underlying model for a run without creating a second OpenClaw agent
-or splitting its identity, workspace, sessions, or memory. The server resolves
-the override onto the run input at claim time; the daemon then emits native
-`--agent <model>` and `--model <model_override>` flags separately.
+agent ID (for example `main`). The optional `runtime_config.model_override` is
+a persistent agent-level setting: it selects the underlying model for every
+run claimed by this agent until the setting is changed or cleared. It does not
+create another OpenClaw agent or split its identity, workspace, sessions, or
+memory. Clear the setting to use the model bound to the selected OpenClaw agent.
+Each claim snapshots the current setting; changing it does not affect runs
+already claimed. The daemon emits native `--agent <model>` and
+`--model <model_override>` flags separately.
 Provider backends may also consume other protocol selectors before launch:
 
 - Pi filters `--thinking` because the first-class `thinking_level` field owns

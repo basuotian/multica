@@ -63,7 +63,7 @@ describe("serializeOpenclawRuntimeConfig", () => {
     });
   });
 
-  it("emits the per-run model override alongside the routing config", () => {
+  it("emits the agent model override alongside the routing config", () => {
     expect(
       serializeOpenclawRuntimeConfig({
         mode: "gateway",
