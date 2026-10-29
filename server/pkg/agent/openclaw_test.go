@@ -1556,3 +1556,112 @@ func TestOpenclawExecuteAllowsCurrentVersion(t *testing.T) {
 		t.Fatal("timeout waiting for result")
 	}
 }
+
+func TestIsOpenclawStateOwnershipLock(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		message string
+		want    bool
+	}{
+		{
+			name:    "gateway lock error",
+			message: `GatewayLockError("failed to acquire gateway state ownership; waited 10000ms for Gateway state ownership")`,
+			want:    true,
+		},
+		{
+			name:    "state directory ownership lock",
+			message: "OpenClaw could not acquire the state-directory ownership lock",
+			want:    true,
+		},
+		{
+			name:    "state dir ownership lock",
+			message: "failed to acquire state dir ownership lock",
+			want:    true,
+		},
+		{
+			name:    "unrelated lock error",
+			message: "failed to acquire workspace ownership lock",
+			want:    false,
+		},
+		{
+			name:    "unrelated openclaw error",
+			message: "openclaw returned no parseable output",
+			want:    false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := isOpenclawStateOwnershipLock(tt.message); got != tt.want {
+				t.Fatalf("isOpenclawStateOwnershipLock(%q) = %v, want %v", tt.message, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestOpenclawExecuteReportsStateOwnershipLockAction(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script fixture is POSIX-only")
+	}
+
+	tests := []struct {
+		name       string
+		mode       string
+		wantAdvice bool
+	}{
+		{name: "local mode", wantAdvice: true},
+		{name: "gateway mode", mode: "gateway", wantAdvice: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			fakePath := filepath.Join(t.TempDir(), "openclaw")
+			script := "#!/bin/sh\n" +
+				"if [ \"$1\" = \"--version\" ]; then\n" +
+				"  echo 'openclaw 2026.5.5 c37871e'\n" +
+				"  exit 0\n" +
+				"fi\n" +
+				"echo 'GatewayLockError(\"failed to acquire gateway state ownership; waited 10000ms for Gateway state ownership\")' >&2\n" +
+				"exit 1\n"
+			writeTestExecutable(t, fakePath, []byte(script))
+
+			backend, err := New("openclaw", Config{ExecutablePath: fakePath, Logger: slog.Default()})
+			if err != nil {
+				t.Fatalf("new openclaw backend: %v", err)
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			session, err := backend.Execute(ctx, "prompt", ExecOptions{
+				Timeout:      5 * time.Second,
+				OpenclawMode: tt.mode,
+			})
+			if err != nil {
+				t.Fatalf("Execute: %v", err)
+			}
+			go func() {
+				for range session.Messages {
+				}
+			}()
+
+			select {
+			case result := <-session.Result:
+				if result.Status != "failed" {
+					t.Fatalf("status = %q, want failed", result.Status)
+				}
+				gotAdvice := strings.Contains(result.Error, "backends.openclaw.state_dir") &&
+					strings.Contains(result.Error, "OPENCLAW_STATE_DIR")
+				if gotAdvice != tt.wantAdvice {
+					t.Fatalf("actionable state-dir advice = %v, want %v; error: %s", gotAdvice, tt.wantAdvice, result.Error)
+				}
+			case <-time.After(10 * time.Second):
+				t.Fatal("timeout waiting for result")
+			}
+		})
+	}
+}
